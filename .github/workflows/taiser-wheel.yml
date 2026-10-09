@@ -54,8 +54,10 @@ jobs:
         env:
           CAPNP_PREFIX: ${{ github.workspace }}/.cache/capnp
         run: |
+          # The install script checks the installed version through PATH.
+          export PATH="$CAPNP_PREFIX/bin:$PATH"
           bash scripts/install-capnp.sh
-          echo "${{ github.workspace }}/.cache/capnp/bin" >> "$GITHUB_PATH"
+          echo "$CAPNP_PREFIX/bin" >> "$GITHUB_PATH"
 
       - name: Cap'n Proto (macOS)
         if: runner.os == 'macOS'
@@ -96,7 +98,7 @@ jobs:
 
   release:
     needs: wheel
-    if: ${{ !cancelled() }}
+    if: ${{ success() }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
