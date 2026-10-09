@@ -587,7 +587,9 @@ pub fn dispatch_ws_message(
                             size_precision,
                             ts_init,
                         ) {
-                            Ok(report) => emitter.send_position_report(report),
+                            Ok(report) => emitter.send_position_report(
+                                report.with_avg_px_open_precision(instrument.price_precision()),
+                            ),
                             Err(e) => log::error!("Failed to parse position report: {e}"),
                         }
                     }

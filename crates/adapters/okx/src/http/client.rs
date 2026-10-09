@@ -5564,7 +5564,10 @@ impl OKXHttpClient {
                     "failed to parse position status report for instrument {}",
                     position.inst_id
                 )
-            })?;
+            })?
+            // OKX `avgPx` is not on the price tick, while reconciliation books the synthetic
+            // opening fill at instrument precision: allow one unit at that precision.
+            .with_avg_px_open_precision(inst.price_precision());
             reports.push(report);
         }
 
