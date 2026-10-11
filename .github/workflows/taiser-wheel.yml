@@ -129,19 +129,36 @@ jobs:
           TOOLCHAIN="$(bash scripts/rust-toolchain.sh)"
           rustup toolchain install "$TOOLCHAIN" --profile minimal
           rustup default "$TOOLCHAIN"
-      - name: Tests of the cherry-picked fixes
-        run: |
-          cargo test --locked -p nautilus-execution reconciliation
-          cargo test --locked -p nautilus-live --test integration manager
-          cargo test --locked -p nautilus-okx
+      - name: cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # nextest runs each test in its own process, as upstream CI does: the live crate's serial
+      # tests register a global logger and fail under plain `cargo test`.
+      - name: OKX adapter
+        run: cargo nextest run --locked -p nautilus-okx --no-fail-fast
+      - name: Reconciliation
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --locked -p nautilus-execution --no-fail-fast -E 'test(reconciliation)'
+      - name: Live node and execution manager
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --locked -p nautilus-live --no-fail-fast
 
+  # A release is immutable: consumers pin its wheels by SHA-256, and a rebuild is not byte-identical.
+  # It is published only by a manual dispatch, after wheels and tests pass, and never replaced –
+  # a rebuild ships under a new version (taiser.N+1).
   release:
-    needs: wheel
-    if: ${{ success() }}
+    needs: [wheel, rust-tests]
+    if: ${{ success() && github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Download wheels
         uses: actions/download-artifact@v4
         with:
@@ -159,11 +176,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v2.0.0rc6-taiser.2"
-          gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' python/pyproject.toml | head -1)"
+          TAG="v${VERSION/+/-}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release $TAG already exists – releases are immutable, bump the version"; exit 1
+          fi
           gh release create "$TAG" dist/* \
             --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --prerelease \
-            --title "2.0.0rc6+taiser.2" \
+            --title "$VERSION" \
             --notes "nautilus_trader 2.0.0rc6 with two upstream develop fixes cherry-picked: c9d6b25bd (reconciliation keeps off-tick average prices, #5276) and fb2a2b7c3 (OKX conditional order amendments via amend-algos, #5275). Built from ${{ github.sha }}. SHA-256 sums in SHA256SUMS."
