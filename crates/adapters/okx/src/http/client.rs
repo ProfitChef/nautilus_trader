@@ -115,10 +115,9 @@ use super::{
 use crate::{
     common::{
         consts::{
-            OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_HTTP_URL, OKX_NAUTILUS_BROKER_ID,
-            OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE, OKX_SUPPORTED_ORDER_TYPES,
-            OKX_SUPPORTED_TIME_IN_FORCE, okx_reduce_only_wire_value,
-            spot_trade_quote_ccy_wire_value,
+            OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_HTTP_URL, OKX_POST_ONLY_CANCEL_REASON,
+            OKX_POST_ONLY_CANCEL_SOURCE, OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE,
+            okx_broker_id, okx_reduce_only_wire_value, spot_trade_quote_ccy_wire_value,
         },
         credential::Credential,
         enums::{
@@ -6450,7 +6449,7 @@ impl OKXHttpClient {
             td_mode,
             ccy: None,
             cl_ord_id: Some(client_order_id.as_str().to_string()),
-            tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+            tag: Some(okx_broker_id().to_string()),
             side,
             pos_side,
             ord_type,
@@ -6526,7 +6525,7 @@ impl OKXHttpClient {
         let request = OKXPlaceSpreadOrderRequest {
             sprd_id: instrument_id.symbol.as_str().to_string(),
             cl_ord_id: Some(client_order_id.as_str().to_string()),
-            tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+            tag: Some(okx_broker_id().to_string()),
             side: OKXSide::from(order_side),
             ord_type,
             sz: quantity.to_string(),
@@ -6708,7 +6707,7 @@ impl OKXHttpClient {
             tgt_ccy: None,
             pos_side,
             close_position: None,
-            tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+            tag: Some(okx_broker_id().to_string()),
             reduce_only,
             close_fraction,
             callback_ratio,

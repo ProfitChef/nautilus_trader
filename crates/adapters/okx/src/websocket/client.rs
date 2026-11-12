@@ -82,8 +82,8 @@ use super::{
 };
 use crate::common::{
     consts::{
-        OKX_NAUTILUS_BROKER_ID, OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE,
-        OKX_WS_PUBLIC_URL, OKX_WS_TOPIC_DELIMITER, okx_reduce_only_wire_value, select_book_channel,
+        OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE, OKX_WS_PUBLIC_URL,
+        OKX_WS_TOPIC_DELIMITER, okx_broker_id, okx_reduce_only_wire_value, select_book_channel,
         spot_trade_quote_ccy_wire_value,
     },
     credential::Credential,
@@ -2723,7 +2723,7 @@ impl OKXWebSocketClient {
             builder.px(p.to_string());
         }
 
-        builder.tag(OKX_NAUTILUS_BROKER_ID);
+        builder.tag(okx_broker_id());
 
         let params = builder
             .build()
@@ -3181,7 +3181,7 @@ impl OKXWebSocketClient {
                     builder.trade_quote_ccy(trade_quote_ccy);
                 }
 
-                builder.tag(OKX_NAUTILUS_BROKER_ID);
+                builder.tag(okx_broker_id());
 
                 let params = builder.build().map_err(|e| {
                     OKXWsError::ClientError(format!("Build order params error: {e}"))
@@ -3420,7 +3420,7 @@ impl OKXWebSocketClient {
             builder.active_px(active.to_string());
         }
 
-        builder.tag(OKX_NAUTILUS_BROKER_ID);
+        builder.tag(okx_broker_id());
 
         let params = builder
             .build()

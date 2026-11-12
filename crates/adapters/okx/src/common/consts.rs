@@ -38,6 +38,51 @@ pub static OKX_CLIENT_ID: LazyLock<ClientId> = LazyLock::new(|| ClientId::new(Us
 /// See <https://www.okx.com/docs-v5/en/#overview-broker-program> for further details.
 pub const OKX_NAUTILUS_BROKER_ID: &str = "5328c82e5542BCDE";
 
+/// Environment variable that overrides the broker code sent in the OKX order `tag` (fork-only).
+pub const OKX_BROKER_ID_ENV: &str = "OKX_BROKER_ID";
+
+/// Maximum length of the OKX order `tag` field.
+pub const OKX_TAG_MAX_LEN: usize = 16;
+
+/// Resolves the broker code from a raw environment value.
+///
+/// The OKX order `tag` is a combination of case-sensitive alphanumerics of up to 16 characters.
+/// A missing or empty value keeps [`OKX_NAUTILUS_BROKER_ID`]. An invalid value never fails an
+/// order: it falls back to [`OKX_NAUTILUS_BROKER_ID`] as well and returns `false` in the second
+/// element, so the caller can log it once.
+#[must_use]
+pub fn resolve_okx_broker_id(raw: Option<&str>) -> (String, bool) {
+    match raw {
+        None | Some("") => (OKX_NAUTILUS_BROKER_ID.to_string(), true),
+        Some(value)
+            if value.len() <= OKX_TAG_MAX_LEN && value.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+        {
+            (value.to_string(), true)
+        }
+        Some(_) => (OKX_NAUTILUS_BROKER_ID.to_string(), false),
+    }
+}
+
+/// Broker code sent in the `tag` of every order this process places, read once from
+/// [`OKX_BROKER_ID_ENV`] (fork-only; upstream hard-codes [`OKX_NAUTILUS_BROKER_ID`]).
+pub static OKX_BROKER_ID: LazyLock<String> = LazyLock::new(|| {
+    let raw = std::env::var(OKX_BROKER_ID_ENV).ok();
+    let (broker_id, valid) = resolve_okx_broker_id(raw.as_deref());
+    if !valid {
+        log::warn!(
+            "{OKX_BROKER_ID_ENV} is not 1..={OKX_TAG_MAX_LEN} ASCII alphanumerics, \
+             using the default broker code"
+        );
+    }
+    broker_id
+});
+
+/// The broker code for the OKX order `tag`, see [`OKX_BROKER_ID`].
+#[must_use]
+pub fn okx_broker_id() -> &'static str {
+    OKX_BROKER_ID.as_str()
+}
+
 /// Default lookback for terminal orders and fills during reconciliation.
 ///
 /// Active orders and current positions are requested independently of this window. The three-day
@@ -426,6 +471,23 @@ mod tests {
     #[case("", true)] // empty: OKX rejects, but core ClientOrderId never produces empty
     fn test_validate_okx_client_order_id(#[case] cl_ord_id: &str, #[case] expected_ok: bool) {
         assert_eq!(validate_okx_client_order_id(cl_ord_id).is_ok(), expected_ok);
+    }
+
+    #[rstest]
+    #[case::unset(None, OKX_NAUTILUS_BROKER_ID, true)]
+    #[case::empty(Some(""), OKX_NAUTILUS_BROKER_ID, true)]
+    #[case::own_code(Some("6099c63a8d75SCDE"), "6099c63a8d75SCDE", true)]
+    #[case::short(Some("ab12"), "ab12", true)]
+    #[case::seventeen_chars(Some("6099c63a8d75SCDE1"), OKX_NAUTILUS_BROKER_ID, false)]
+    #[case::hyphen(Some("6099c63a-d75SCDE"), OKX_NAUTILUS_BROKER_ID, false)]
+    #[case::space(Some(" 6099c63a8d75SCD"), OKX_NAUTILUS_BROKER_ID, false)]
+    #[case::non_ascii(Some("6099c63a8d75SCDÉ"), OKX_NAUTILUS_BROKER_ID, false)]
+    fn test_resolve_okx_broker_id(
+        #[case] raw: Option<&str>,
+        #[case] expected: &str,
+        #[case] expected_valid: bool,
+    ) {
+        assert_eq!(resolve_okx_broker_id(raw), (expected.to_string(), expected_valid));
     }
 
     #[rstest]

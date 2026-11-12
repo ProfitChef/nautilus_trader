@@ -1,6 +1,7 @@
 # Wheel build for 2.0.0rc6 + two upstream develop fixes cherry-picked (fork-only workflow):
 # c9d6b25bd (reconciliation average price precision, #5276) and fb2a2b7c3 (OKX conditional
-# order amendments, #5275).
+# order amendments, #5275). From taiser.3 also a fork-only change: the OKX order `tag` takes the
+# broker code from the OKX_BROKER_ID environment variable (default: the NautilusTrader code).
 #
 # Builds the Python 3.13 wheels this branch ships to its consumer (Linux x86_64 for production,
 # macOS arm64 for local testing) and publishes them as a GitHub release with SHA-256 sums.
@@ -89,7 +90,7 @@ jobs:
       - name: Smoke test
         run: |
           python -m pip install dist/*.whl
-          python -c "import nautilus_trader as nt; print(nt.__version__); assert nt.__version__ == '2.0.0rc6+taiser.2'; from nautilus_trader.adapters.okx import OKXExecutionClientFactory, OKXDataClientFactory"
+          python -c "import nautilus_trader as nt; print(nt.__version__); assert nt.__version__ == '2.0.0rc6+taiser.3'; from nautilus_trader.adapters.okx import OKXExecutionClientFactory, OKXDataClientFactory"
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
@@ -186,4 +187,4 @@ jobs:
             --target "${{ github.sha }}" \
             --prerelease \
             --title "$VERSION" \
-            --notes "nautilus_trader 2.0.0rc6 with two upstream develop fixes cherry-picked: c9d6b25bd (reconciliation keeps off-tick average prices, #5276) and fb2a2b7c3 (OKX conditional order amendments via amend-algos, #5275). Built from ${{ github.sha }}. SHA-256 sums in SHA256SUMS."
+            --notes "nautilus_trader 2.0.0rc6 with two upstream develop fixes cherry-picked: c9d6b25bd (reconciliation keeps off-tick average prices, #5276) and fb2a2b7c3 (OKX conditional order amendments via amend-algos, #5275); fork-only: the OKX order tag takes the broker code from OKX_BROKER_ID (default: the NautilusTrader code). Built from ${{ github.sha }}. SHA-256 sums in SHA256SUMS."

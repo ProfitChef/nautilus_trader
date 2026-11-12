@@ -34,7 +34,7 @@ use anyhow::Context;
 use nautilus_core::UUID4;
 use nautilus_okx::{
     common::{
-        consts::{OKX_NAUTILUS_BROKER_ID, OKX_SUCCESS_CODE, validate_okx_client_order_id},
+        consts::{OKX_SUCCESS_CODE, okx_broker_id, validate_okx_client_order_id},
         enums::{
             OKXAlgoOrderType, OKXEnvironment, OKXInstrumentType, OKXMarginMode, OKXOrderType,
             OKXPositionSide, OKXSide, OKXTradeMode,
@@ -385,7 +385,7 @@ async fn close_position(client: &OKXHttpClient, open: &OpenPosition) -> anyhow::
             td_mode,
             ccy: None,
             cl_ord_id: Some(cl_ord_id),
-            tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
+            tag: Some(okx_broker_id().to_string()),
             side: open.close_side,
             pos_side,
             ord_type: OKXOrderType::Market,
