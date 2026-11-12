@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14]
+        os: [ubuntu-22.04, macos-15]  # macos-14 runners are retired (12.11.2026: "not supported")
     runs-on: ${{ matrix.os }}
     timeout-minutes: 340
     env:
