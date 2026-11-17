@@ -479,6 +479,91 @@ proptest! {
         );
     }
 
+    // Round-trip: the venue position was opened ahead of the window, and the window both adds
+    // to it and reduces it, in any order, without closing it. The synthetic opening must
+    // simulate back to the venue position within tolerance.
+    #[rstest]
+    fn prop_adjust_fills_synthetic_opening_matches_venue_for_mixed_window(
+        opening_side in order_side_strategy(),
+        opening_qty in 1i64..=2_000i64,
+        opening_px_units in 100i64..=100_000i64,
+        window in proptest::collection::vec(
+            (
+                order_side_strategy(),
+                1i64..=800i64,
+                100i64..=100_000i64,
+                venue_order_id_strategy(),
+            ),
+            1..=6,
+        ),
+    ) {
+        let snapshots: Vec<FillSnapshot> = window
+            .iter()
+            .enumerate()
+            .map(|(i, (side, q, p, voi))| {
+                FillSnapshot::new(
+                    *voi,
+                    *side,
+                    Decimal::from(*q),
+                    Decimal::new(*p, 2),
+                    (i as u64) + 2,
+                )
+            })
+            .collect();
+
+        // Single lifecycle: the window has no zero-crossing of its own
+        prop_assume!(detect_zero_crossings(&snapshots).is_empty());
+
+        let opening = FillSnapshot::new(
+            VenueOrderId::new("V-0000"),
+            opening_side,
+            Decimal::from(opening_qty),
+            Decimal::new(opening_px_units, 2),
+            1,
+        );
+
+        // The position stays open on the opening side through the whole window
+        let mut running_qty = Decimal::from(opening.direction()) * opening.qty;
+        for fill in &snapshots {
+            running_qty += Decimal::from(fill.direction()) * fill.qty;
+            prop_assume!(
+                running_qty != Decimal::ZERO
+                    && (running_qty > Decimal::ZERO) == (opening_side == OrderSide::Buy)
+            );
+        }
+
+        let mut history = vec![opening];
+        history.extend(snapshots.iter().cloned());
+        let (venue_qty, venue_value) = simulate_position(&history);
+        let venue_avg = venue_value / venue_qty.abs();
+
+        let venue = VenuePositionSnapshot {
+            side: if venue_qty > Decimal::ZERO {
+                PositionSide::Long
+            } else {
+                PositionSide::Short
+            },
+            qty: venue_qty.abs(),
+            avg_px: venue_avg,
+            avg_px_reconciliation: AvgPxReconciliation::Match,
+            avg_px_precision: None,
+        };
+
+        let adjustment = adjust_fills_for_partial_window(&snapshots, &venue, dec!(0.0001));
+        let is_synth_opening =
+            matches!(adjustment, FillAdjustmentResult::AddSyntheticOpening { .. });
+        prop_assert!(is_synth_opening);
+
+        let effective = apply_adjustment(snapshots, &adjustment);
+        let (eff_qty, eff_value) = simulate_position(&effective);
+        prop_assert_eq!(eff_qty, venue_qty);
+        let eff_avg = eff_value / eff_qty.abs();
+        prop_assert!(
+            (eff_avg - venue_avg).abs() / venue_avg <= dec!(0.0001),
+            "eff_avg={eff_avg}, venue_avg={venue_avg}",
+        );
+    }
+
     // Flip-scenario roundtrip: applying the reconciliation price for a flip
     // should land on target_avg_px after simulation.
     #[rstest]

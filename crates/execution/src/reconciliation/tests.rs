@@ -765,6 +765,464 @@ fn test_adjust_fills_partial_window_synthetic_opening_price(
     );
 }
 
+/// Replays `opening` ahead of the window's fills, returning the simulated quantity and average.
+fn replay_with_opening(opening: &FillSnapshot, window: &[FillSnapshot]) -> (Decimal, Decimal) {
+    let mut fills = vec![opening.clone()];
+    fills.extend_from_slice(window);
+    let (qty, value) = simulate_position(&fills);
+    (qty, value / qty.abs())
+}
+
+fn window_fills(
+    venue_order_id: VenueOrderId,
+    window: &[(OrderSide, Decimal, Decimal)],
+) -> Vec<FillSnapshot> {
+    window
+        .iter()
+        .zip(1000..)
+        .map(|((side, qty, px), ts_event)| {
+            FillSnapshot::new(venue_order_id, *side, *qty, *px, ts_event)
+        })
+        .collect()
+}
+
+#[rstest]
+fn test_adjust_fills_partial_window_reduce_then_add_restores_venue_average() {
+    // OKX ZEC-USDT-SWAP startup on 2026-11-14: the history window opened inside a long of 1120
+    // with a reduction followed by additions. From flat the window nets short 544, so the opening
+    // is a buy of 1664. Priced at the reported average it replayed to 969.81 against the reported
+    // 973.1172633276582 and startup failed the entry-price check. The quantities and the two
+    // averages are the observed ones, the individual fills are chosen to reproduce them.
+    let fills = vec![
+        FillSnapshot::new(
+            create_test_venue_order_id("SELL1"),
+            OrderSide::Sell,
+            dec!(744),
+            dec!(981.50),
+            1000,
+        ),
+        FillSnapshot::new(
+            create_test_venue_order_id("BUY1"),
+            OrderSide::Buy,
+            dec!(120),
+            dec!(955.40),
+            2000,
+        ),
+        FillSnapshot::new(
+            create_test_venue_order_id("BUY2"),
+            OrderSide::Buy,
+            dec!(80),
+            dec!(953.39),
+            3000,
+        ),
+    ];
+    let venue_position = venue_position_snapshot(dec!(1120), dec!(973.1172633276582));
+    assert_eq!(simulate_position(&fills).0, dec!(-544));
+
+    let result = adjust_fills_for_partial_window(&fills, &venue_position, dec!(0.0001));
+
+    match result {
+        FillAdjustmentResult::AddSyntheticOpening {
+            synthetic_fill,
+            existing_fills,
+        } => {
+            assert_eq!(synthetic_fill.venue_order_id, fills[0].venue_order_id);
+            assert_eq!(synthetic_fill.side, OrderSide::Buy);
+            assert_eq!(synthetic_fill.qty, dec!(1664));
+            assert_eq!(synthetic_fill.ts_event, 999);
+            assert_eq!(existing_fills, fills);
+
+            // The average the position had before the window: the reduction leaves 920 of the
+            // opening, the additions bring 120 @ 955.40 and 80 @ 953.39
+            let opening_px = (dec!(1120) * dec!(973.1172633276582)
+                - dec!(120) * dec!(955.40)
+                - dec!(80) * dec!(953.39))
+                / dec!(920);
+            assert_eq!(synthetic_fill.px, opening_px);
+            assert_eq!(opening_px.round_dp(10), dec!(977.1436249206));
+
+            let (qty, avg_px) = replay_with_opening(&synthetic_fill, &fills);
+            assert_eq!(qty, dec!(1120));
+            assert_eq!(avg_px.round_dp(13), dec!(973.1172633276582));
+
+            // The reported average as the opening price is what failed startup
+            let at_reported_avg_px = FillSnapshot {
+                px: venue_position.avg_px,
+                ..synthetic_fill
+            };
+            let (_, avg_px) = replay_with_opening(&at_reported_avg_px, &fills);
+            assert_eq!(avg_px.round_dp(2), dec!(969.81));
+        }
+        _ => panic!("Expected AddSyntheticOpening, was {result:?}"),
+    }
+}
+
+#[rstest]
+#[case::long_reduce_then_add(
+    OrderSide::Buy,
+    &[(OrderSide::Sell, dec!(3), dec!(2.50)), (OrderSide::Buy, dec!(1), dec!(2.40))],
+)]
+#[case::long_add_then_reduce(
+    OrderSide::Buy,
+    &[(OrderSide::Buy, dec!(5), dec!(2.60)), (OrderSide::Sell, dec!(3), dec!(2.70))],
+)]
+#[case::long_interleaved(
+    OrderSide::Buy,
+    &[
+        (OrderSide::Sell, dec!(4), dec!(2.50)),
+        (OrderSide::Buy, dec!(2), dec!(2.30)),
+        (OrderSide::Sell, dec!(5), dec!(2.55)),
+        (OrderSide::Buy, dec!(3), dec!(2.65)),
+    ],
+)]
+#[case::short_reduce_then_add(
+    OrderSide::Sell,
+    &[(OrderSide::Buy, dec!(3), dec!(2.40)), (OrderSide::Sell, dec!(1), dec!(2.50))],
+)]
+#[case::short_add_then_reduce(
+    OrderSide::Sell,
+    &[(OrderSide::Sell, dec!(5), dec!(2.30)), (OrderSide::Buy, dec!(3), dec!(2.20))],
+)]
+#[case::short_interleaved(
+    OrderSide::Sell,
+    &[
+        (OrderSide::Buy, dec!(4), dec!(2.40)),
+        (OrderSide::Sell, dec!(2), dec!(2.60)),
+        (OrderSide::Buy, dec!(5), dec!(2.35)),
+        (OrderSide::Sell, dec!(3), dec!(2.25)),
+    ],
+)]
+fn test_adjust_fills_partial_window_mixed_fills_recover_opening(
+    #[case] opening_side: OrderSide,
+    #[case] window: &[(OrderSide, Decimal, Decimal)],
+) {
+    // The venue position is an opening of 12 @ 2.45 followed by the window's fills, which both
+    // add to it and reduce it without closing it
+    let venue_order_id = create_test_venue_order_id("ORDER1");
+    let opening = FillSnapshot::new(venue_order_id, opening_side, dec!(12), dec!(2.45), 999);
+    let fills = window_fills(venue_order_id, window);
+    assert!(detect_zero_crossings(&fills).is_empty());
+    let (venue_qty, venue_avg_px) = replay_with_opening(&opening, &fills);
+    let venue_position = venue_position_snapshot(venue_qty, venue_avg_px);
+
+    let result = adjust_fills_for_partial_window(&fills, &venue_position, dec!(0.0001));
+
+    match result {
+        FillAdjustmentResult::AddSyntheticOpening {
+            synthetic_fill,
+            existing_fills,
+        } => {
+            assert_eq!(synthetic_fill.venue_order_id, venue_order_id);
+            assert_eq!(synthetic_fill.side, opening_side);
+            assert_eq!(synthetic_fill.qty, dec!(12));
+            assert_eq!(synthetic_fill.ts_event, 999);
+            assert_eq!(synthetic_fill.px.round_dp(18), dec!(2.45));
+            assert_eq!(existing_fills, fills);
+
+            let (qty, avg_px) = replay_with_opening(&synthetic_fill, &fills);
+            assert_eq!(qty, venue_qty);
+            assert_eq!(avg_px.round_dp(18), venue_avg_px.round_dp(18));
+        }
+        _ => panic!("Expected AddSyntheticOpening, was {result:?}"),
+    }
+}
+
+#[rstest]
+fn test_adjust_fills_partial_window_reductions_only_open_at_reported_average() {
+    // Reductions never move the average, so the opening carries the reported one unchanged
+    let venue_order_id = create_test_venue_order_id("ORDER1");
+    let fills = window_fills(
+        venue_order_id,
+        &[
+            (OrderSide::Sell, dec!(300), dec!(980.10)),
+            (OrderSide::Sell, dec!(244), dec!(985.20)),
+        ],
+    );
+    let venue_position = venue_position_snapshot(dec!(1120), dec!(973.1172633276582));
+
+    let result = adjust_fills_for_partial_window(&fills, &venue_position, dec!(0.0001));
+
+    assert_eq!(
+        result,
+        FillAdjustmentResult::AddSyntheticOpening {
+            synthetic_fill: FillSnapshot::new(
+                venue_order_id,
+                OrderSide::Buy,
+                dec!(1664),
+                dec!(973.1172633276582),
+                999,
+            ),
+            existing_fills: fills,
+        }
+    );
+}
+
+#[rstest]
+// short 15 -> long 5 -> short 10: the last flip prices the position, not the opening
+#[case::flips_inside_window(
+    dec!(-10),
+    &[(OrderSide::Buy, dec!(20), dec!(90)), (OrderSide::Sell, dec!(15), dec!(110))],
+    OrderSide::Sell,
+    dec!(15),
+)]
+// 30 -> flat -> long 15: the position reopens inside the window
+#[case::lands_flat_inside_window(
+    dec!(15),
+    &[(OrderSide::Sell, dec!(30), dec!(110)), (OrderSide::Buy, dec!(15), dec!(120))],
+    OrderSide::Buy,
+    dec!(30),
+)]
+// short 3 -> long 7: the window buys more than the reported position holds
+#[case::opens_on_the_opposite_side(
+    dec!(7),
+    &[(OrderSide::Buy, dec!(10), dec!(95))],
+    OrderSide::Sell,
+    dec!(3),
+)]
+// 12 -> 7 -> 10: the addition alone carries more value than the reported position
+#[case::no_positive_price(
+    dec!(10),
+    &[(OrderSide::Sell, dec!(5), dec!(150)), (OrderSide::Buy, dec!(3), dec!(400))],
+    OrderSide::Buy,
+    dec!(12),
+)]
+fn test_adjust_fills_partial_window_opening_without_solution_uses_reported_average(
+    #[case] venue_qty: Decimal,
+    #[case] window: &[(OrderSide, Decimal, Decimal)],
+    #[case] opening_side: OrderSide,
+    #[case] opening_qty: Decimal,
+) {
+    let venue_order_id = create_test_venue_order_id("ORDER1");
+    let fills = window_fills(venue_order_id, window);
+    assert!(detect_zero_crossings(&fills).is_empty());
+    let venue_position = venue_position_snapshot(venue_qty, dec!(100));
+
+    let result = adjust_fills_for_partial_window(&fills, &venue_position, dec!(0.0001));
+
+    let synthetic_fill =
+        FillSnapshot::new(venue_order_id, opening_side, opening_qty, dec!(100), 999);
+
+    // The window alone sets the average here, no opening price brings it to the reported one
+    let (qty, avg_px) = replay_with_opening(&synthetic_fill, &fills);
+    assert_eq!(qty, venue_qty);
+    assert_ne!(avg_px, dec!(100));
+
+    assert_eq!(
+        result,
+        FillAdjustmentResult::AddSyntheticOpening {
+            synthetic_fill,
+            existing_fills: fills,
+        }
+    );
+}
+
+#[rstest]
+// From flat the window is long 100 @ 0.56 and the report rounds to 0.5601: the window average
+// replays to 0.56, solving against the rounded figure would open at 1.56
+#[case::window_average(
+    dec!(100.02),
+    dec!(0.5601),
+    &[(OrderSide::Buy, dec!(200), dec!(0.56)), (OrderSide::Sell, dec!(100), dec!(0.57))],
+    OrderSide::Buy,
+    dec!(0.02),
+    dec!(0.56),
+)]
+// The opening keeps 0.4 of the 1016 held, so the reported average replays to 0.56199 while
+// solving against the rounded figure would open at 0.3328
+#[case::reported_average(
+    dec!(-1016),
+    dec!(0.5619),
+    &[
+        (OrderSide::Buy, dec!(612), dec!(0.5658)),
+        (OrderSide::Buy, dec!(576), dec!(0.5621)),
+        (OrderSide::Sell, dec!(511), dec!(0.5438)),
+        (OrderSide::Buy, dec!(844), dec!(0.5695)),
+        (OrderSide::Sell, dec!(1015), dec!(0.5620)),
+    ],
+    OrderSide::Sell,
+    dec!(1522),
+    dec!(0.5619),
+)]
+fn test_adjust_fills_partial_window_mixed_fills_keep_price_that_replays_within_venue_rounding(
+    #[case] venue_qty: Decimal,
+    #[case] venue_avg_px: Decimal,
+    #[case] window: &[(OrderSide, Decimal, Decimal)],
+    #[case] opening_side: OrderSide,
+    #[case] opening_qty: Decimal,
+    #[case] opening_px: Decimal,
+) {
+    let venue_order_id = create_test_venue_order_id("ORDER1");
+    let fills = window_fills(venue_order_id, window);
+    let venue_position = VenuePositionSnapshot {
+        avg_px_precision: Some(4),
+        ..venue_position_snapshot(venue_qty, venue_avg_px)
+    };
+
+    let result = adjust_fills_for_partial_window(&fills, &venue_position, dec!(0.0001));
+
+    assert_eq!(
+        result,
+        FillAdjustmentResult::AddSyntheticOpening {
+            synthetic_fill: FillSnapshot::new(
+                venue_order_id,
+                opening_side,
+                opening_qty,
+                opening_px,
+                999,
+            ),
+            existing_fills: fills,
+        }
+    );
+}
+
+#[rstest]
+fn test_adjust_fills_partial_window_solves_venue_rounded_average_that_does_not_replay() {
+    // From flat the window averages 0.5252, which the report's 0.5253 matches at 4 dp, but an
+    // opening at the window average replays to 0.5243. The position opened at 0.53
+    let venue_order_id = create_test_venue_order_id("ORDER1");
+    let fills = window_fills(
+        venue_order_id,
+        &[
+            (OrderSide::Buy, dec!(291), dec!(0.50)),
+            (OrderSide::Sell, dec!(62), dec!(0.52)),
+            (OrderSide::Buy, dec!(129), dec!(0.57)),
+        ],
+    );
+    let venue_position = VenuePositionSnapshot {
+        avg_px_precision: Some(4),
+        ..venue_position_snapshot(dec!(482), dec!(0.5253))
+    };
+
+    let result = adjust_fills_for_partial_window(&fills, &venue_position, dec!(0.0001));
+
+    match result {
+        FillAdjustmentResult::AddSyntheticOpening {
+            synthetic_fill,
+            existing_fills,
+        } => {
+            assert_eq!(synthetic_fill.side, OrderSide::Buy);
+            assert_eq!(synthetic_fill.qty, dec!(124));
+            assert_eq!(synthetic_fill.px.round_dp(6), dec!(0.530003));
+            assert_eq!(existing_fills, fills);
+
+            let (qty, avg_px) = replay_with_opening(&synthetic_fill, &fills);
+            assert_eq!(qty, dec!(482));
+            assert_eq!(avg_px.round_dp(18), dec!(0.5253));
+        }
+        _ => panic!("Expected AddSyntheticOpening, was {result:?}"),
+    }
+}
+
+#[rstest]
+#[case::every_order_reported(&["SELL1", "BUY1", "BUY2"], true)]
+#[case::one_order_not_reported(&["SELL1", "BUY1"], false)]
+#[case::no_order_reported(&[], false)]
+fn test_process_mass_status_reduce_then_add_window_prices_synthetic_opening(
+    #[case] reported_orders: &[&str],
+    #[case] solved: bool,
+) {
+    // The engine applies a fill only through its order. Without an order report the fill is
+    // dropped, the opening stands without the window it was priced for, and the price that holds
+    // is the one of a fill applied after the window position: here the reported average
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let instrument_id = instrument.id();
+    let account_id = AccountId::from("TEST-001");
+    let window = [
+        ("SELL1", OrderSide::Sell, "744.000", "981.50", 1_000),
+        ("BUY1", OrderSide::Buy, "120.000", "955.40", 2_000),
+        ("BUY2", OrderSide::Buy, "80.000", "953.39", 3_000),
+    ];
+    let mut mass_status = ExecutionMassStatus::new(
+        ClientId::from("TEST"),
+        account_id,
+        Venue::from("SIM"),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+
+    for (venue_order_id, side, qty, px, ts_event) in window {
+        mass_status.add_fill_reports(vec![FillReport::new(
+            account_id,
+            instrument_id,
+            VenueOrderId::from(venue_order_id),
+            TradeId::from(format!("T-{venue_order_id}").as_str()),
+            side,
+            Quantity::from(qty),
+            Price::from(px),
+            Money::from("0.00 USDT"),
+            LiquiditySide::Taker,
+            None,
+            None,
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_event),
+            None,
+        )]);
+
+        if reported_orders.contains(&venue_order_id) {
+            mass_status.add_order_reports(vec![OrderStatusReport::new(
+                account_id,
+                instrument_id,
+                None,
+                VenueOrderId::from(venue_order_id),
+                side.into(),
+                OrderType::Market,
+                TimeInForce::Ioc,
+                OrderStatus::Filled,
+                Quantity::from(qty),
+                Quantity::from(qty),
+                UnixNanos::from(ts_event),
+                UnixNanos::from(ts_event),
+                UnixNanos::from(ts_event),
+                None,
+            )]);
+        }
+    }
+
+    mass_status.add_position_reports(vec![PositionStatusReport::new(
+        account_id,
+        instrument_id,
+        PositionSide::Long,
+        Quantity::from("1120.000"),
+        UnixNanos::from(4_000),
+        UnixNanos::from(4_000),
+        None,
+        None,
+        Some(dec!(973.1172633276582)),
+    )]);
+
+    let result = process_mass_status_for_reconciliation(&mass_status, &instrument, None).unwrap();
+
+    // The window's fills stay, the synthetic opening comes as an order of its own
+    assert_eq!(result.fills.len(), 4);
+    assert_eq!(result.orders.len(), reported_orders.len() + 1);
+    let (synthetic_id, synthetic_order) = result
+        .orders
+        .iter()
+        .find(|(id, _)| id.as_str().starts_with("S-"))
+        .unwrap();
+    assert_eq!(synthetic_order.order_side, OrderSide::Buy.into());
+    assert_eq!(synthetic_order.filled_qty, Quantity::from("1664.000"));
+
+    let opening_px = if solved {
+        (dec!(1120) * dec!(973.1172633276582) - dec!(120) * dec!(955.40) - dec!(80) * dec!(953.39))
+            / dec!(920)
+    } else {
+        dec!(973.1172633276582)
+    };
+
+    let synthetic_fills = &result.fills[synthetic_id];
+    assert_eq!(synthetic_fills.len(), 1);
+    assert_eq!(synthetic_fills[0].order_side, OrderSide::Buy);
+    assert_eq!(synthetic_fills[0].last_qty, Quantity::from("1664.000"));
+    assert_eq!(
+        synthetic_fills[0].last_px,
+        super::reconciliation_price(opening_px, &instrument).unwrap()
+    );
+    assert_eq!(synthetic_fills[0].ts_event, UnixNanos::from(999));
+    assert_eq!(synthetic_order.avg_px, Some(opening_px));
+    assert!(result.order_only_ids.is_empty());
+}
+
 #[rstest]
 fn test_reconciliation_price_flat_to_long(_instrument: InstrumentAny) {
     let result = calculate_reconciliation_price(
