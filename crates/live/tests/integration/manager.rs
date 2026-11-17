@@ -11014,6 +11014,202 @@ async fn test_adjust_fills_creates_synthetic_for_partial_window() {
     );
 }
 
+/// Builds a mass status for a netting position of `venue_qty` @ `venue_avg_px` whose history
+/// window holds one filled market order per entry of `window`, in that order.
+fn create_partial_window_mass_status(
+    instrument_id: InstrumentId,
+    position_side: PositionSide,
+    venue_qty: &str,
+    venue_avg_px: Decimal,
+    window: &[(OrderSide, &str, &str)],
+    report_orders: bool,
+) -> ExecutionMassStatus {
+    let mut mass_status = create_mass_status(vec![], vec![]);
+    mass_status.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        position_side,
+        Quantity::from(venue_qty),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None, // Netting mode
+        Some(venue_avg_px),
+    )]);
+
+    for (i, (side, qty, px)) in window.iter().enumerate() {
+        let venue_order_id = VenueOrderId::from(format!("V-WINDOW-{i}").as_str());
+        let ts_event = UnixNanos::from(1_000_001 + i as u64);
+
+        if report_orders {
+            mass_status.add_order_reports(vec![
+                OrderStatusReport::new(
+                    test_account_id(),
+                    instrument_id,
+                    None,
+                    venue_order_id,
+                    (*side).into(),
+                    OrderType::Market,
+                    TimeInForce::Ioc,
+                    OrderStatus::Filled,
+                    Quantity::from(*qty),
+                    Quantity::from(*qty),
+                    ts_event,
+                    ts_event,
+                    ts_event,
+                    None,
+                )
+                .with_avg_px(Decimal::from_str_exact(px).unwrap()),
+            ]);
+        }
+
+        mass_status.add_fill_reports(vec![FillReport::new(
+            test_account_id(),
+            instrument_id,
+            venue_order_id,
+            TradeId::from(format!("T-WINDOW-{i}").as_str()),
+            *side,
+            Quantity::from(*qty),
+            Price::from(*px),
+            Money::from("0.00 USDT"),
+            LiquiditySide::Taker,
+            None,
+            None,
+            ts_event,
+            ts_event,
+            None,
+        )]);
+    }
+
+    mass_status
+}
+
+#[rstest]
+#[case::long_reduce_then_add(
+    PositionSide::Long,
+    "1120.000",
+    dec!(973.1172633276582),
+    &[
+        (OrderSide::Sell, "744.000", "981.50"),
+        (OrderSide::Buy, "120.000", "955.40"),
+        (OrderSide::Buy, "80.000", "953.39"),
+    ],
+)]
+#[case::short_reduce_then_add(
+    PositionSide::Short,
+    "1120.000",
+    dec!(973.1172633276582),
+    &[
+        (OrderSide::Buy, "744.000", "981.50"),
+        (OrderSide::Sell, "120.000", "955.40"),
+        (OrderSide::Sell, "80.000", "953.39"),
+    ],
+)]
+#[case::long_add_then_reduce(
+    PositionSide::Long,
+    "10.000",
+    dec!(3000),
+    &[(OrderSide::Buy, "5.000", "3100.00"), (OrderSide::Sell, "3.000", "3200.00")],
+)]
+#[case::short_add_then_reduce(
+    PositionSide::Short,
+    "10.000",
+    dec!(3000),
+    &[(OrderSide::Sell, "5.000", "3100.00"), (OrderSide::Buy, "3.000", "3200.00")],
+)]
+#[tokio::test]
+async fn test_partial_window_mixed_fills_restore_reported_average(
+    #[case] position_side: PositionSide,
+    #[case] venue_qty: &str,
+    #[case] venue_avg_px: Decimal,
+    #[case] window: &[(OrderSide, &str, &str)],
+) {
+    // The history window opens inside a position that the window then both reduces and adds
+    // to. The first case is the OKX startup of 2026-11-14: long 1120, a reduction followed by
+    // additions, where a synthetic opening at the reported average replayed to 969.81. The
+    // add-then-reduce cases are 8 @ 2937.50 ahead of the window. The synthetic opening comes
+    // ahead of the window, so it must carry the price from which the window's fills lead back
+    // to the reported average, or startup fails the entry-price check.
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    ctx.add_instrument(test_instrument());
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(StrategyId::from("EXTERNAL"), OmsType::Netting);
+    let mass_status = create_partial_window_mass_status(
+        instrument_id,
+        position_side,
+        venue_qty,
+        venue_avg_px,
+        window,
+        true,
+    );
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+
+    assert_eq!(result.unresolved_positions, Vec::<String>::new());
+
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].side, position_side);
+    assert_eq!(positions[0].quantity, Quantity::from(venue_qty));
+
+    // Position stores its average as f64 and the synthetic price is held at fixed precision
+    let avg_px_open = Decimal::from_str_exact(&positions[0].avg_px_open.to_string()).unwrap();
+    assert!(
+        (avg_px_open - venue_avg_px).abs() < dec!(0.000001),
+        "avg_px_open={avg_px_open}, venue_avg_px={venue_avg_px}",
+    );
+}
+
+#[tokio::test]
+async fn test_partial_window_without_order_reports_keeps_reported_average() {
+    // Fills that come without an order report or a cached order are dropped, so the synthetic
+    // opening is all the position gets and the later quantity correction is a reduction, which
+    // cannot move the average. The opening must then carry the reported average, not the price
+    // that would lead to it through a window nobody replays.
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    ctx.add_instrument(test_instrument());
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(StrategyId::from("EXTERNAL"), OmsType::Netting);
+    let venue_avg_px = dec!(973.1172633276582);
+    let mass_status = create_partial_window_mass_status(
+        instrument_id,
+        PositionSide::Long,
+        "1120.000",
+        venue_avg_px,
+        &[
+            (OrderSide::Sell, "744.000", "981.50"),
+            (OrderSide::Buy, "120.000", "955.40"),
+            (OrderSide::Buy, "80.000", "953.39"),
+        ],
+        false,
+    );
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+
+    assert_eq!(result.unresolved_positions, Vec::<String>::new());
+
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].side, PositionSide::Long);
+    assert_eq!(positions[0].quantity, Quantity::from("1120.000"));
+
+    let avg_px_open = Decimal::from_str_exact(&positions[0].avg_px_open.to_string()).unwrap();
+    assert!(
+        (avg_px_open - venue_avg_px).abs() < dec!(0.000001),
+        "avg_px_open={avg_px_open}, venue_avg_px={venue_avg_px}",
+    );
+}
+
 #[rstest]
 #[case::netting(false)]
 #[case::hedging(true)]

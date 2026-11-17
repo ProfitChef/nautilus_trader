@@ -1,7 +1,12 @@
 # Wheel build for 2.0.0rc6 + two upstream develop fixes cherry-picked (fork-only workflow):
 # c9d6b25bd (reconciliation average price precision, #5276) and fb2a2b7c3 (OKX conditional
-# order amendments, #5275). From taiser.3 also a fork-only change: the OKX order `tag` takes the
-# broker code from the OKX_BROKER_ID environment variable (default: the NautilusTrader code).
+# order amendments, #5275), plus two fork-only changes:
+# - from taiser.3: the OKX order `tag` takes the broker code from the OKX_BROKER_ID environment
+#   variable (default: the NautilusTrader code);
+# - from taiser.4 (branch taiser/rc6-recon-opening-price, built from taiser.2 without the broker
+#   code): startup reconciliation prices the synthetic opening fill ahead of a partial window, so
+#   a window that both reduces the position and adds to it restores the reported average.
+# taiser.5 merges the two branches: the first wheel that carries both changes.
 #
 # Builds the Python 3.13 wheels this branch ships to its consumer (Linux x86_64 for production,
 # macOS arm64 for local testing) and publishes them as a GitHub release with SHA-256 sums.
@@ -12,7 +17,7 @@ name: taiser-wheel
 on:
   workflow_dispatch:
   push:
-    branches: [taiser/rc6-upstream-fixes]
+    branches: [taiser/rc6-upstream-fixes, taiser/rc6-recon-opening-price]
 
 permissions:
   contents: read
@@ -90,7 +95,7 @@ jobs:
       - name: Smoke test
         run: |
           python -m pip install dist/*.whl
-          python -c "import nautilus_trader as nt; print(nt.__version__); assert nt.__version__ == '2.0.0rc6+taiser.3'; from nautilus_trader.adapters.okx import OKXExecutionClientFactory, OKXDataClientFactory"
+          python -c "import nautilus_trader as nt; print(nt.__version__); assert nt.__version__ == '2.0.0rc6+taiser.5'; from nautilus_trader.adapters.okx import OKXExecutionClientFactory, OKXDataClientFactory"
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
@@ -187,4 +192,4 @@ jobs:
             --target "${{ github.sha }}" \
             --prerelease \
             --title "$VERSION" \
-            --notes "nautilus_trader 2.0.0rc6 with two upstream develop fixes cherry-picked: c9d6b25bd (reconciliation keeps off-tick average prices, #5276) and fb2a2b7c3 (OKX conditional order amendments via amend-algos, #5275); fork-only: the OKX order tag takes the broker code from OKX_BROKER_ID (default: the NautilusTrader code). Built from ${{ github.sha }}. SHA-256 sums in SHA256SUMS."
+            --notes "nautilus_trader 2.0.0rc6 with two upstream develop fixes cherry-picked: c9d6b25bd (reconciliation keeps off-tick average prices, #5276) and fb2a2b7c3 (OKX conditional order amendments via amend-algos, #5275); fork-only: the OKX order tag takes the broker code from OKX_BROKER_ID (default: the NautilusTrader code, as in taiser.3) and startup reconciliation prices the synthetic opening fill ahead of a partial window, so a window of reductions and additions restores the reported average entry price (as in taiser.4). Built from ${{ github.sha }}. SHA-256 sums in SHA256SUMS."

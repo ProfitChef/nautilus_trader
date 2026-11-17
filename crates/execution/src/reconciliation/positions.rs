@@ -112,7 +112,19 @@ fn process_mass_status_for_reconciliation_inner(
         });
     }
 
-    let result = adjust_fills_for_partial_window(&fill_snapshots, &venue_position, tol);
+    // The engine applies a fill only through its order: without an order report or a cached
+    // order it is dropped, and a synthetic opening is then not followed by the window it saw.
+    // Reported orders the engine filters out or nets into another position are not seen here
+    let window_orders_reported = fill_snapshots
+        .iter()
+        .all(|fill| order_map.contains_key(&fill.venue_order_id));
+
+    let result = adjust_fills(
+        &fill_snapshots,
+        &venue_position,
+        tol,
+        window_orders_reported,
+    );
 
     match result {
         FillAdjustmentResult::NoAdjustment => {}
@@ -212,14 +224,18 @@ fn process_mass_status_for_reconciliation_inner(
 /// This function analyzes fills and determines if adjustments are needed when the reconciliation
 /// window doesn't capture the complete position history (missing opening fills).
 ///
+/// `replays_window` says whether the engine will apply every one of `fills` after a synthetic
+/// opening fill, which decides how that fill may be priced, see [`synthetic_opening_price`].
+///
 /// # Returns
 ///
 /// Returns `FillAdjustmentResult` indicating what adjustments (if any) are needed.
 #[must_use]
-pub(super) fn adjust_fills_for_partial_window(
+fn adjust_fills(
     fills: &[FillSnapshot],
     venue_position: &VenuePositionSnapshot,
     tolerance: Decimal,
+    replays_window: bool,
 ) -> FillAdjustmentResult {
     if fills.is_empty() {
         return FillAdjustmentResult::NoAdjustment;
@@ -324,8 +340,14 @@ pub(super) fn adjust_fills_for_partial_window(
                 Some(oldest_value / oldest_qty.abs())
             };
 
-            let reconciliation_price =
-                synthetic_opening_price(oldest_qty, oldest_avg_px, venue_position);
+            let reconciliation_price = synthetic_opening_price(
+                &oldest_lifecycle_fills,
+                oldest_qty,
+                oldest_avg_px,
+                venue_position,
+                tolerance,
+                replays_window,
+            );
 
             if let Some(opening_px) = reconciliation_price {
                 // Calculate opening quantity needed
@@ -400,14 +422,38 @@ pub(super) fn adjust_fills_for_partial_window(
     FillAdjustmentResult::NoAdjustment
 }
 
+/// Adjusts fills for a window the engine replays in full, see [`adjust_fills`].
+#[cfg(test)]
+#[must_use]
+pub(super) fn adjust_fills_for_partial_window(
+    fills: &[FillSnapshot],
+    venue_position: &VenuePositionSnapshot,
+    tolerance: Decimal,
+) -> FillAdjustmentResult {
+    adjust_fills(fills, venue_position, tolerance, true)
+}
+
+/// Prices the synthetic fill that opens the venue position ahead of the window's fills.
+///
+/// [`calculate_reconciliation_price`] prices a fill applied after the window position. An opening
+/// applied ahead of the window can carry the same price as long as the window only adds to the
+/// position or only reduces it. Once the window does both, that price no longer replays to the
+/// venue position, and the price is solved instead, see [`solve_synthetic_opening_price`].
+///
+/// The solved price holds only if the engine applies the whole window after the opening, which
+/// `replays_window` asserts. Otherwise the opening stands alone and the price of a fill applied
+/// after the window position is kept.
 fn synthetic_opening_price(
+    window_fills: &[FillSnapshot],
     window_qty: Decimal,
     window_avg_px: Option<Decimal>,
     venue_position: &VenuePositionSnapshot,
+    tolerance: Decimal,
+    replays_window: bool,
 ) -> Option<Decimal> {
-    match venue_position.avg_px_reconciliation {
+    let after_window_px = match venue_position.avg_px_reconciliation {
         // The synthetic fill opens the position before the window's fills
-        AvgPxReconciliation::OpeningOnly => Some(venue_position.avg_px),
+        AvgPxReconciliation::OpeningOnly => return Some(venue_position.avg_px),
         AvgPxReconciliation::Match => calculate_reconciliation_price(
             window_qty,
             window_avg_px,
@@ -416,7 +462,123 @@ fn synthetic_opening_price(
             AvgPxReconciliation::Match,
             venue_position.avg_px_precision,
         ),
+    };
+
+    if !replays_window {
+        return after_window_px;
     }
+
+    let opening_qty = venue_position.signed_qty() - window_qty;
+
+    match after_window_px {
+        Some(px)
+            if px <= Decimal::ZERO
+                || opening_restores_venue_position(
+                    opening_qty,
+                    px,
+                    window_fills,
+                    venue_position,
+                    tolerance,
+                ) =>
+        {
+            Some(px)
+        }
+        _ => solve_synthetic_opening_price(window_fills, opening_qty, venue_position)
+            .or(after_window_px),
+    }
+}
+
+/// Returns whether an opening of `opening_qty` (signed) at `opening_px`, applied ahead of the
+/// window's fills, simulates to the venue position.
+fn opening_restores_venue_position(
+    opening_qty: Decimal,
+    opening_px: Decimal,
+    window_fills: &[FillSnapshot],
+    venue_position: &VenuePositionSnapshot,
+    tolerance: Decimal,
+) -> bool {
+    let Some(first_fill) = window_fills.first() else {
+        return false;
+    };
+
+    if opening_qty == Decimal::ZERO {
+        return false;
+    }
+
+    let opening_side = if opening_qty > Decimal::ZERO {
+        OrderSide::Buy
+    } else {
+        OrderSide::Sell
+    };
+
+    let mut fills = Vec::with_capacity(window_fills.len() + 1);
+    fills.push(FillSnapshot::new(
+        first_fill.venue_order_id,
+        opening_side,
+        opening_qty.abs(),
+        opening_px,
+        first_fill.ts_event.saturating_sub(1),
+    ));
+    fills.extend_from_slice(window_fills);
+
+    let (qty, value) = simulate_position(&fills);
+
+    check_position_match(qty, value, venue_position, tolerance)
+}
+
+/// Solves the price at which a synthetic opening fill restores the venue average entry price.
+///
+/// Replays an opening of `opening_qty` (signed) followed by `window_fills` under the netting
+/// rules of [`simulate_position`]. While the position stays on the opening side, an accumulation
+/// adds its own value and a reduction scales the value held, so the final value is affine in the
+/// opening price: `opening_weight * opening_px + window_value`. Equating it to the value of the
+/// venue position gives the price.
+///
+/// Returns `None` when the position closes or flips inside the window, where the opening price
+/// no longer determines the final average, and when no positive price solves the equation.
+fn solve_synthetic_opening_price(
+    window_fills: &[FillSnapshot],
+    opening_qty: Decimal,
+    venue_position: &VenuePositionSnapshot,
+) -> Option<Decimal> {
+    if opening_qty == Decimal::ZERO {
+        return None;
+    }
+
+    let opening_direction: i8 = if opening_qty > Decimal::ZERO { 1 } else { -1 };
+    let mut held_qty = opening_qty.abs();
+    let mut opening_weight = held_qty;
+    let mut window_value = Decimal::ZERO;
+
+    for fill in window_fills {
+        if fill.direction() == opening_direction {
+            window_value = window_value.checked_add(fill.qty.checked_mul(fill.px)?)?;
+            held_qty = held_qty.checked_add(fill.qty)?;
+            continue;
+        }
+
+        if fill.qty >= held_qty {
+            return None;
+        }
+
+        // Multiply before dividing, which keeps the scaling exact until an addition applies
+        let remaining_qty = held_qty - fill.qty;
+        opening_weight = opening_weight
+            .checked_mul(remaining_qty)?
+            .checked_div(held_qty)?;
+        window_value = window_value
+            .checked_mul(remaining_qty)?
+            .checked_div(held_qty)?;
+        held_qty = remaining_qty;
+    }
+
+    let opening_px = venue_position
+        .qty
+        .checked_mul(venue_position.avg_px)?
+        .checked_sub(window_value)?
+        .checked_div(opening_weight)?;
+
+    (opening_px > Decimal::ZERO).then_some(opening_px)
 }
 
 /// Check if a cached position matches the venue position report within tolerance.
@@ -611,7 +773,7 @@ fn position_report_to_snapshot(report: &PositionStatusReport) -> VenuePositionSn
 ///
 /// Callers must guard `Flat` upstream; reaching it here means a flat venue
 /// position slipped past the qty==0 early returns in
-/// [`adjust_fills_for_partial_window`].
+/// [`adjust_fills`].
 fn position_to_order_side(side: PositionSide) -> OrderSide {
     match side {
         PositionSide::Long => OrderSide::Buy,
